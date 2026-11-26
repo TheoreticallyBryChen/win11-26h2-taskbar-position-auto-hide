@@ -3,8 +3,8 @@
 // @name            Windows 11 26H2 Taskbar Auto-Hide (All Edges)
 // @description     Auto-hides the Windows 11 taskbar on Left, Top, Right, and Bottom edges with a slide animation.
 // @version         1.0.1
-// @author          YOUR_NAME
-// @github          https://github.com/YOUR_GITHUB_USERNAME
+// @author          tbc06w
+// @github          https://github.com/TheoreticallyBryChen
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -ldwmapi -lshell32 -luser32 -lcomctl32 -lgdi32
