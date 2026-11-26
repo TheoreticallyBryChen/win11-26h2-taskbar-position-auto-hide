@@ -2,7 +2,7 @@
 // @id              win11-26h2-taskbar-position-auto-hide
 // @name            Windows 11 26H2 Taskbar Auto-Hide (All Edges)
 // @description     Auto-hides the Windows 11 taskbar on Left, Top, Right, and Bottom edges with a slide animation.
-// @version         1.0.1
+// @version         1.0.2
 // @author          tbc06w
 // @github          https://github.com/TheoreticallyBryChen
 // @include         explorer.exe
@@ -217,8 +217,6 @@ TaskbarState* FindTaskbarForMonitor(HMONITOR hMon) {
     return nullptr;
 }
 
-// Expands only the edge occupied by this monitor's taskbar so other registered
-// app bars (docked toolbars/launchers) retain their reserved space.
 RECT ComputeExpandedWorkArea(const TaskbarState& tb, const RECT& baseWork) {
     RECT expanded = baseWork;
     switch (tb.edge) {
@@ -259,34 +257,6 @@ RECT ComputeShrunkWorkAreaFromBase(const TaskbarState& tb, const RECT& currentWo
             break;
     }
     return work;
-}
-
-BOOL WINAPI SystemParametersInfoW_Hook(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni) {
-    if (uiAction == SPI_SETWORKAREA && g_reclaimWorkAreaActive.load(std::memory_order_acquire)) {
-        if (!pvParam) {
-            return TRUE;
-        }
-        const RECT* req = static_cast<const RECT*>(pvParam);
-        HMONITOR hMon = MonitorFromRect(req, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{};
-        mi.cbSize = sizeof(mi);
-        if (hMon && GetMonitorInfoW(hMon, &mi)) {
-            // Only rewrite monitors that actually host a managed taskbar
-            if (TaskbarState* tb = FindTaskbarForMonitor(hMon)) {
-                tb->explorerWorkRect = *req;
-                tb->hasExplorerWorkRect = true;
-
-                RECT expanded = ComputeExpandedWorkArea(*tb, *req);
-                if (EqualRect(&mi.rcWork, &expanded)) {
-                    return TRUE;
-                }
-                return SystemParametersInfoW_Original(
-                    uiAction, uiParam, &expanded,
-                    fWinIni & ~(SPIF_SENDCHANGE | SPIF_SENDWININICHANGE));
-            }
-        }
-    }
-    return SystemParametersInfoW_Original(uiAction, uiParam, pvParam, fWinIni);
 }
 
 bool IsTaskbarClassBuf(const wchar_t* cls) {
@@ -404,6 +374,87 @@ bool RectMatchesApprox(const RECT& a, const RECT& b, long tol = 4) {
            std::abs(a.top - b.top) <= tol &&
            std::abs(a.right - b.right) <= tol &&
            std::abs(a.bottom - b.bottom) <= tol;
+}
+
+bool UpdateTaskbarGeometryFromRect(TaskbarState& tb, const RECT& rect) {
+    if (!IsWindow(tb.hwnd)) {
+        return false;
+    }
+    HMONITOR hMon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!hMon || !GetMonitorInfoW(hMon, &mi)) {
+        return false;
+    }
+
+    if (!IsValidDockedTaskbarRect(rect, mi.rcMonitor)) {
+        return false;
+    }
+
+    TaskbarEdge detectedEdge = DetectEdgeFromRect(rect, mi.rcMonitor);
+    if (detectedEdge == TaskbarEdge::Unknown) {
+        return false;
+    }
+
+    bool changed = !tb.validGeometry ||
+                   tb.hMonitor != hMon ||
+                   tb.edge != detectedEdge ||
+                   !EqualRect(&tb.normalRect, &rect) ||
+                   !EqualRect(&tb.monitorRect, &mi.rcMonitor);
+
+    tb.hMonitor = hMon;
+    tb.monitorRect = mi.rcMonitor;
+    tb.normalRect = rect;
+    tb.edge = detectedEdge;
+    tb.validGeometry = true;
+
+    if (changed) {
+        tb.hasExplorerWorkRect = false;
+    }
+    return changed;
+}
+
+bool UpdateTaskbarGeometry(TaskbarState& tb) {
+    if (!IsWindow(tb.hwnd) || tb.isApplyingAnimPos) {
+        return false;
+    }
+    RECT curRect{};
+    if (GetWindowRect(tb.hwnd, &curRect)) {
+        return UpdateTaskbarGeometryFromRect(tb, curRect);
+    }
+    return false;
+}
+
+BOOL WINAPI SystemParametersInfoW_Hook(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni) {
+    if (uiAction == SPI_SETWORKAREA && g_reclaimWorkAreaActive.load(std::memory_order_acquire)) {
+        if (!pvParam) {
+            return TRUE;
+        }
+        const RECT* req = static_cast<const RECT*>(pvParam);
+        HMONITOR hMon = MonitorFromRect(req, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (hMon && GetMonitorInfoW(hMon, &mi)) {
+            if (TaskbarState* tb = FindTaskbarForMonitor(hMon)) {
+                // Ensure edge is fresh if Explorer changed taskbar side right before SPI_SETWORKAREA
+                if (tb->isCloaked || tb->animProgress >= 0.999f) {
+                    UpdateTaskbarGeometry(*tb);
+                }
+
+                tb->explorerWorkRect = *req;
+                tb->hasExplorerWorkRect = true;
+
+                RECT expanded = ComputeExpandedWorkArea(*tb, *req);
+                if (EqualRect(&mi.rcWork, &expanded)) {
+                    return TRUE;
+                }
+                return SystemParametersInfoW_Original(
+                    uiAction, uiParam, &expanded,
+                    fWinIni & ~(SPIF_SENDCHANGE | SPIF_SENDWININICHANGE));
+            }
+        }
+    }
+    return SystemParametersInfoW_Original(uiAction, uiParam, pvParam, fWinIni);
 }
 
 BOOL CALLBACK EnumAdjustWorkAreaWindowsProc(HWND hwnd, LPARAM lParam) {
@@ -631,40 +682,6 @@ bool StepTaskbarAnimation(TaskbarState& tb, int durationMs) {
     return t < 1.0f;
 }
 
-void UpdateTaskbarGeometryFromRect(TaskbarState& tb, const RECT& rect) {
-    if (!IsWindow(tb.hwnd)) {
-        return;
-    }
-    HMONITOR hMon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!hMon || !GetMonitorInfoW(hMon, &mi)) {
-        return;
-    }
-
-    tb.hMonitor = hMon;
-    tb.monitorRect = mi.rcMonitor;
-
-    if (IsValidDockedTaskbarRect(rect, mi.rcMonitor)) {
-        TaskbarEdge detectedEdge = DetectEdgeFromRect(rect, mi.rcMonitor);
-        if (detectedEdge != TaskbarEdge::Unknown) {
-            tb.normalRect = rect;
-            tb.edge = detectedEdge;
-            tb.validGeometry = true;
-        }
-    }
-}
-
-void UpdateTaskbarGeometry(TaskbarState& tb) {
-    if (!IsWindow(tb.hwnd) || tb.isApplyingAnimPos) {
-        return;
-    }
-    RECT curRect{};
-    if (GetWindowRect(tb.hwnd, &curRect)) {
-        UpdateTaskbarGeometryFromRect(tb, curRect);
-    }
-}
-
 int ScaleByWindowDpi(HWND hwnd, int px96) {
     UINT dpi = GetDpiForWindow(hwnd);
     if (dpi == 0) {
@@ -753,12 +770,13 @@ void EnsureWorkAreaState(bool allowReclaim) {
 }
 
 void EvaluateHoverAndAnimate(HWND primaryHwnd, const Settings& settings) {
-    // Stay completely passive when Windows' built-in auto-hide is enabled
     if (IsNativeAutoHideEnabled()) {
         if (g_reclaimWorkAreaActive.load(std::memory_order_relaxed)) {
             g_reclaimWorkAreaActive.store(false, std::memory_order_release);
             for (auto& [hwnd, tb] : g_taskbars) {
                 tb.isHoverShown = false;
+                tb.animStartProgress = 1.0f;
+                tb.animTargetProgress = 1.0f;
                 SetTaskbarSlidePose(tb, 1.0f);
             }
         }
@@ -856,6 +874,26 @@ void EvaluateHoverAndAnimate(HWND primaryHwnd, const Settings& settings) {
     }
 }
 
+void HandleGeometryChanged(TaskbarState& tb) {
+    tb.hasExplorerWorkRect = false;
+    g_needsInitialWorkAreaSync = true;
+
+    if (!IsNativeAutoHideEnabled()) {
+        EnsureWorkAreaState(true);
+    }
+
+    // Re-apply current pose cleanly for the new edge/size without snapping back to old rect
+    if (tb.isHoverShown) {
+        tb.animStartProgress = 1.0f;
+        tb.animTargetProgress = 1.0f;
+        SetTaskbarSlidePose(tb, 1.0f);
+    } else {
+        tb.animStartProgress = 0.0f;
+        tb.animTargetProgress = 0.0f;
+        SetTaskbarSlidePose(tb, 0.0f);
+    }
+}
+
 LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
                                      UINT uMsg,
                                      WPARAM wParam,
@@ -936,25 +974,19 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
                     return 0;
                 }
 
-                // Keep normalRect in sync if Explorer moves/resizes the taskbar while hidden/animating
                 auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
-                if (wp && !(wp->flags & SWP_NOMOVE) && !(wp->flags & SWP_NOSIZE) &&
-                    wp->cx > 0 && wp->cy > 0) {
-                    RECT req{wp->x, wp->y, wp->x + wp->cx, wp->y + wp->cy};
-                    UpdateTaskbarGeometryFromRect(tb, req);
-                }
-
-                if (tb.animProgress < 0.999f && !tb.isCloaked && wp) {
-                    int x = tb.normalRect.left;
-                    int y = tb.normalRect.top;
-                    HRGN clipRgn = nullptr;
-                    ComputeSlidPoseRect(tb, tb.animProgress, &x, &y, &clipRgn);
-                    if (clipRgn) {
-                        DeleteObject(clipRgn);
+                if (wp && ((wp->flags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE))) {
+                    RECT cur{};
+                    if (GetWindowRect(hWnd, &cur)) {
+                        int newX = (wp->flags & SWP_NOMOVE) ? cur.left : wp->x;
+                        int newY = (wp->flags & SWP_NOMOVE) ? cur.top : wp->y;
+                        int newW = (wp->flags & SWP_NOSIZE) ? (cur.right - cur.left) : wp->cx;
+                        int newH = (wp->flags & SWP_NOSIZE) ? (cur.bottom - cur.top) : wp->cy;
+                        if (newW > 0 && newH > 0) {
+                            RECT req{newX, newY, newX + newW, newY + newH};
+                            UpdateTaskbarGeometryFromRect(tb, req);
+                        }
                     }
-                    wp->x = x;
-                    wp->y = y;
-                    wp->flags &= ~SWP_NOMOVE;
                 }
             }
             break;
@@ -966,24 +998,30 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
                 return 0;
             }
             LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
-            if (it != g_taskbars.end() &&
-                !it->second.isCloaked &&
-                it->second.animProgress >= 0.999f) {
-                UpdateTaskbarGeometry(it->second);
+            if (it != g_taskbars.end()) {
+                TaskbarState& tb = it->second;
+                if (tb.isCloaked || tb.animProgress >= 0.999f) {
+                    if (UpdateTaskbarGeometry(tb)) {
+                        HandleGeometryChanged(tb);
+                    }
+                }
             }
             return res;
         }
 
         case WM_DISPLAYCHANGE:
-        case WM_DPICHANGED:
+        case WM_DPICHANGED: {
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
             if (isPrimary) {
                 g_pidExeCache.clear();
                 g_needsInitialWorkAreaSync = true;
                 for (auto& [tbHwnd, tb] : g_taskbars) {
                     tb.isHoverShown = false;
                     tb.hasExplorerWorkRect = false;
-                    SetTaskbarSlidePose(tb, 1.0f);
                     UpdateTaskbarGeometry(tb);
+                    tb.animStartProgress = 0.0f;
+                    tb.animTargetProgress = 0.0f;
+                    SetTaskbarSlidePose(tb, 0.0f);
                 }
                 if (!IsNativeAutoHideEnabled()) {
                     EnsureWorkAreaState(true);
@@ -991,16 +1029,26 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
                 Settings settings = GetSettingsCopy();
                 EvaluateHoverAndAnimate(hWnd, settings);
             }
-            break;
+            return res;
+        }
 
-        case WM_SETTINGCHANGE:
+        case WM_SETTINGCHANGE: {
+            LRESULT res = DefSubclassProc(hWnd, uMsg, wParam, lParam);
             if (isPrimary && lParam &&
                 _wcsicmp(reinterpret_cast<LPCWSTR>(lParam), L"TraySettings") == 0) {
                 g_needsInitialWorkAreaSync = true;
                 for (auto& [tbHwnd, tb] : g_taskbars) {
                     tb.hasExplorerWorkRect = false;
-                    SetTaskbarSlidePose(tb, 1.0f);
                     UpdateTaskbarGeometry(tb);
+                    if (tb.isHoverShown) {
+                        tb.animStartProgress = 1.0f;
+                        tb.animTargetProgress = 1.0f;
+                        SetTaskbarSlidePose(tb, 1.0f);
+                    } else {
+                        tb.animStartProgress = 0.0f;
+                        tb.animTargetProgress = 0.0f;
+                        SetTaskbarSlidePose(tb, 0.0f);
+                    }
                 }
                 if (!IsNativeAutoHideEnabled()) {
                     EnsureWorkAreaState(true);
@@ -1008,7 +1056,8 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
                 Settings settings = GetSettingsCopy();
                 EvaluateHoverAndAnimate(hWnd, settings);
             }
-            break;
+            return res;
+        }
 
         case WM_NCDESTROY:
             g_taskbars.erase(hWnd);
@@ -1194,7 +1243,6 @@ void Wh_ModUninit() {
         std::vector<HWND> threadTaskbars;
         EnumThreadWindows(tid, EnumThreadTaskbarsProc, reinterpret_cast<LPARAM>(&threadTaskbars));
 
-        // Synchronous wait ensures cleanup completes before removing subclasses and unloading DLL
         SendMessageW(primary, g_msgUninitCleanup, 0, 0);
 
         for (HWND hwnd : threadTaskbars) {
